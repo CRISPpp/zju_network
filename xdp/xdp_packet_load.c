@@ -7,19 +7,18 @@ static const char *__doc__ = "XDP loader and stats program\n"
 #include <string.h>
 #include <errno.h>
 #include <getopt.h>
-#include <arpa/inet.h>
+
 #include <locale.h>
 #include <unistd.h>
 #include <time.h>
-#include <signal.h>
-#include <net/if.h>
-#include <linux/if_link.h>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <xdp/libxdp.h>
 
-
+#include <net/if.h>
+#include <linux/if_link.h> /* depend on kernel-headers installed */
+#include <signal.h>
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
@@ -72,7 +71,6 @@ int find_map_fd(struct bpf_object *bpf_obj, const char *mapname)
 	struct bpf_map *map;
 	int map_fd = -1;
 
-	/* Lesson#3: bpf_object to bpf_map */
 	map = bpf_object__find_map_by_name(bpf_obj, mapname);
         if (!map) {
 		fprintf(stderr, "ERR: cannot find map by name: %s\n", mapname);
@@ -84,29 +82,245 @@ int find_map_fd(struct bpf_object *bpf_obj, const char *mapname)
 	return map_fd;
 }
 
-
-static void stats_print(struct packet_info *p)
+#define NANOSEC_PER_SEC 1000000000 /* 10^9 */
+static __u64 gettime(void)
 {
-	char src[INET6_ADDRSTRLEN];
-    char dst[INET6_ADDRSTRLEN];
-	if ((strcmp(inet_ntop(AF_INET, &(p->src_ip), src, INET_ADDRSTRLEN), "127.0.0.1")) == 0) {
-		if ((strcmp(inet_ntop(AF_INET, &(p->src_ip), src, INET_ADDRSTRLEN), "127.0.0.1")) == 0) {
-			if (p->src_port == 9999 || p -> dst_port == 9999) {
-				printf("Packet Data - src_ip: %s,  src_port: %u, dst_ip: %s,  dst_port: %u, timestamp(us): %llu\n",
-    			inet_ntop(AF_INET, &(p->src_ip), src, INET_ADDRSTRLEN), p->src_port,
-				inet_ntop(AF_INET, &(p->dst_ip), dst, INET_ADDRSTRLEN), p->dst_port,
-				p->timestamp);
-			}
-		}
-	}
+	struct timespec t;
+	int res;
 
+	res = clock_gettime(CLOCK_MONOTONIC, &t);
+	if (res < 0) {
+		fprintf(stderr, "Error with gettimeofday! (%i)\n", res);
+		exit(EXIT_FAIL);
+	}
+	return (__u64) t.tv_sec * NANOSEC_PER_SEC + t.tv_nsec;
 }
 
+struct record {
+	__u64 timestamp;
+	struct packet_info total;
+};
 
-static int handle_event(void *ctx, void *data, size_t data_sz)
+struct stats_record {
+	struct record stats[1]; 
+};
+
+static double calc_period(struct record *r, struct record *p)
 {
-	struct packet_info *p = data;
-	stats_print(p);
+	double period_ = 0;
+	__u64 period = 0;
+
+	period = r->timestamp - p->timestamp;
+	if (period > 0)
+		period_ = ((double) period / NANOSEC_PER_SEC);
+
+	return period_;
+}
+
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+static void stats_print(struct stats_record *stats_rec,
+			struct stats_record *stats_prev, struct config *cfg)
+{
+	struct record *rec, *prev;
+	double period;
+
+	for (int i = 0; i < 1; i ++)
+	{
+		rec  = &stats_rec->stats[i];
+		prev = &stats_prev->stats[i];
+
+		period = calc_period(rec, prev);
+		if (period == 0)
+		       return;
+	
+
+		__u64 receive_packets = rec->total.receive_packets - prev->total.receive_packets;
+    	double receive_pps = receive_packets / period;
+
+    	__u64 receive_bytes = rec->total.receive_bytes - prev->total.receive_bytes;
+    	double receive_bps = (receive_bytes * 8) / period;
+
+    	__u64 send_packets = rec->total.send_packets - prev->total.send_packets;
+    	double send_pps = send_packets / period;
+
+    	__u64 send_bytes = rec->total.send_bytes - prev->total.send_bytes;
+    	double send_bps = (send_bytes * 8) / period;
+
+    	char *fmt = "%s: %lld pkts (pps: %'10.0f) %'11lld KB (bps: %'6.0f bits/s) period: %f\n";
+
+    	// printf("Interface: %s\n", cfg->ifname);
+    	// printf("Receive stats:\n");
+    	// printf(fmt, cfg->ifname, rec->total.receive_packets, receive_pps, 
+        //    	rec->total.receive_bytes / 1024, receive_bps, period);
+
+    	// printf("Send stats:\n");
+    	printf(fmt, cfg->ifname, rec->total.send_packets, send_pps, 
+           	rec->total.send_bytes / 1024, send_bps, period);
+		printf("\n\n\n");
+	}
+}
+
+/* BPF_MAP_TYPE_ARRAY */
+void map_get_value_array(int fd, __u32 key, struct packet_info *value)
+{
+	if ((bpf_map_lookup_elem(fd, &key, value)) != 0) {
+		value->receive_packets = -1;
+		value->send_packets = -1;
+		fprintf(stderr,
+			"ERR: bpf_map_lookup_elem failed key:0x%X\n", key);
+	}
+}
+
+void map_get_value_percpu_array(int fd, __u32 key, struct packet_info *value)
+{
+	unsigned int nr_cpus = libbpf_num_possible_cpus();
+	struct packet_info values[nr_cpus];
+	__u64 sum_bytes = 0;
+	__u64 sum_pkts = 0;
+	__u64 sum_sbytes = 0;
+	__u64 sum_spkts = 0;
+	int i;
+
+	if ((bpf_map_lookup_elem(fd, &key, values)) != 0) {
+		fprintf(stderr,
+			"ERR: bpf_map_lookup_elem failed key:0x%X\n", key);
+		return;
+	}
+
+	/* Sum values from each CPU */
+	for (i = 0; i < nr_cpus; i++) {
+		sum_pkts  += values[i].receive_packets;
+		sum_bytes += values[i].receive_bytes;
+		sum_spkts  += values[i].send_packets;
+		sum_sbytes += values[i].send_bytes;
+	}
+	value->receive_packets = sum_pkts;
+	value->receive_bytes = sum_bytes;
+	value->send_packets = sum_spkts;
+	value->send_bytes = sum_sbytes;
+}
+
+static bool map_collect(int fd, __u32 map_type, __u32 key, struct record *rec)
+{
+	struct packet_info value;
+
+	/* Get time as close as possible to reading map contents */
+	rec->timestamp = gettime();
+
+	switch (map_type) {
+	case BPF_MAP_TYPE_ARRAY:
+		map_get_value_array(fd, key, &value);
+		break;
+	case BPF_MAP_TYPE_PERCPU_ARRAY:
+		/* fall-through */
+	default:
+		fprintf(stderr, "ERR: Unknown map_type(%u) cannot handle\n",
+			map_type);
+		return false;
+		break;
+	}
+
+	rec->total.receive_bytes = value.receive_bytes;
+	rec->total.receive_packets = value.receive_packets;
+	rec->total.send_bytes = value.send_bytes;
+	rec->total.send_packets = value.send_packets;
+	return true;
+}
+
+static void stats_collect(int map_fd, __u32 map_type,
+			  struct stats_record *stats_rec)
+{
+	/* Assignment#2: Collect other XDP actions stats  */
+	// __u32 key = XDP_ABORTED;
+	// __u32 key2 = XDP_DROP;
+	__u32 key3 = XDP_PASS;
+	// __u32 key4 = XDP_TX;
+	// __u32 key5 = XDP_REDIRECT;
+	map_collect(map_fd, map_type, key3, &stats_rec->stats[0]);
+	// map_collect(map_fd, map_type, key2, &stats_rec->stats[1]);
+	// map_collect(map_fd, map_type, key3, &stats_rec->stats[2]);
+	// map_collect(map_fd, map_type, key4, &stats_rec->stats[3]);
+	// map_collect(map_fd, map_type, key5, &stats_rec->stats[4]);
+}
+
+static void stats_poll(int map_fd, __u32 map_type, int interval, struct config *cfg)
+{
+	struct stats_record prev, record = { 0 };
+
+	/* Trick to pretty printf with thousands separators use %' */
+	setlocale(LC_NUMERIC, "en_US");
+
+	/* Print stats "header" */
+	if (verbose) {
+		printf("\n");
+		printf("%-12s\n", "XDP-action");
+	}
+
+	/* Get initial reading quickly */
+	stats_collect(map_fd, map_type, &record);
+	usleep(1000000/4);
+
+	while (exiting == 0) {
+		prev = record; /* struct copy */
+		stats_collect(map_fd, map_type, &record);
+		stats_print(&record, &prev, cfg);
+		sleep(interval);
+	}
+	char errmsg[1024];
+	int err;
+
+	cfg->unload_all = true;
+	err = do_unload(cfg);
+	if (err) {
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "Couldn't unload XDP program %d: %s\n",
+			(*cfg).prog_id, errmsg);
+	}
+	printf("Success: Unloading XDP prog name: %s\n", (*cfg).progname);
+}
+
+static int __check_map_fd_info(int map_fd, struct bpf_map_info *info,
+			       struct bpf_map_info *exp)
+{
+	__u32 info_len = sizeof(*info);
+	int err;
+
+	if (map_fd < 0)
+		return EXIT_FAIL;
+
+        /* BPF-info via bpf-syscall */
+	err = bpf_obj_get_info_by_fd(map_fd, info, &info_len);
+	if (err) {
+		fprintf(stderr, "ERR: %s() can't get info - %s\n",
+			__func__,  strerror(errno));
+		return EXIT_FAIL_BPF;
+	}
+
+	if (exp->key_size && exp->key_size != info->key_size) {
+		fprintf(stderr, "ERR: %s() "
+			"Map key size(%d) mismatch expected size(%d)\n",
+			__func__, info->key_size, exp->key_size);
+		return EXIT_FAIL;
+	}
+	if (exp->value_size && exp->value_size != info->value_size) {
+		fprintf(stderr, "ERR: %s() "
+			"Map value size(%d) mismatch expected size(%d)\n",
+			__func__, info->value_size, exp->value_size);
+		return EXIT_FAIL;
+	}
+	if (exp->max_entries && exp->max_entries != info->max_entries) {
+		fprintf(stderr, "ERR: %s() "
+			"Map max_entries(%d) mismatch expected size(%d)\n",
+			__func__, info->max_entries, exp->max_entries);
+		return EXIT_FAIL;
+	}
+	if (exp->type && exp->type  != info->type) {
+		fprintf(stderr, "ERR: %s() "
+			"Map type(%d) mismatch expected type(%d)\n",
+			__func__, info->type, exp->type);
+		return EXIT_FAIL;
+	}
+
 	return 0;
 }
 
@@ -116,9 +330,11 @@ int main(int argc, char **argv)
        return 1;
     }
 
+	struct bpf_map_info map_expect = { 0 };
 	struct bpf_map_info info = { 0 };
 	struct xdp_program *program;
 	int stats_map_fd;
+	int interval = 2;
 	char errmsg[1024];
 	int err;
 
@@ -166,12 +382,21 @@ int main(int argc, char **argv)
 		       xdp_program__id(program), cfg.ifname, cfg.ifindex);
 	}
 
-	stats_map_fd = find_map_fd(xdp_program__bpf_obj(program), "packet_ringbuf");
+	stats_map_fd = find_map_fd(xdp_program__bpf_obj(program), "xdp_stats_map");
 	if (stats_map_fd < 0) {
 		/* xdp_link_detach(cfg.ifindex, cfg.xdp_flags, 0); */
 		return EXIT_FAIL_BPF;
 	}
 
+	/* Lesson#4: check map info, e.g. datarec is expected size */
+	map_expect.key_size    = sizeof(__u32);
+	map_expect.value_size  = sizeof(struct packet_info);
+	map_expect.max_entries = 1 << 24;
+	err = __check_map_fd_info(stats_map_fd, &info, &map_expect);
+	if (err) {
+		fprintf(stderr, "ERR: map via FD not compatible\n");
+		return err;
+	}
 	if (verbose) {
 		printf("\nCollecting stats from BPF map\n");
 		printf(" - BPF map (bpf_map_type:%d) id:%d name:%s"
@@ -180,33 +405,7 @@ int main(int argc, char **argv)
 		       info.key_size, info.value_size, info.max_entries
 		       );
 	}
-	struct ring_buffer *rb = NULL;
-	rb = ring_buffer__new(stats_map_fd, handle_event, NULL, NULL);
-	if (!rb) {
-		err = -1;
-		fprintf(stderr, "Failed to create ring buffer\n");
-	}
 
-	while (!exiting) {
-		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
-		if (err == -EINTR) {
-			err = 0;
-			break;
-		}
-		if (err < 0) {
-			printf("Error polling perf buffer: %d\n", err);
-			break;
-		}
-	}
-
-	ring_buffer__free(rb);
-	cfg.unload_all = true;
-	err = do_unload(&cfg);
-	if (err) {
-		libxdp_strerror(err, errmsg, sizeof(errmsg));
-		fprintf(stderr, "Couldn't unload XDP program %d: %s\n",
-			cfg.prog_id, errmsg);
-	}
-	printf("Success: Unloading XDP prog name: %s\n", cfg.progname);
-	return err < 0 ? -err : EXIT_OK;
+	stats_poll(stats_map_fd, info.type, interval, &cfg);
+	return EXIT_OK;
 }

@@ -11,6 +11,10 @@ struct packet_info {
     __u16 src_port;
     __u16 dst_port;
     __u64 timestamp;
+    __u64 receive_packets;
+	__u64 receive_bytes;
+    __u64 send_packets;
+	__u64 send_bytes;
 };
 
 __u32 hash_packet_info(const struct packet_info *pi) {
