@@ -21,7 +21,7 @@
 ./close_hotspot.sh
 ```
 ## common：通用类
-## login：校园网认证
+## login：校园网认证-参考https://blog.csdn.net/krypton12138/article/details/120529137
 ```
 直接执行打包好的可执行文件（在release中）
 ./login -u username -p password
