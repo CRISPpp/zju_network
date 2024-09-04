@@ -1,6 +1,7 @@
 import argparse
 import urllib
 import urllib.request as urllib2
+import hashlib
 
 # 参考https://blog.csdn.net/krypton12138/article/details/120529137
 class Login:
@@ -12,11 +13,12 @@ class Login:
         self.headers["Content-Type"] = "text/html; charset=gb2312"
 
         self.username = username
-        self.password = password
+        password_md5 = hashlib.md5(password.encode('utf-8')).hexdigest()[8:24]
+        self.password = password_md5
 
 
     def login(self):
-        print(f"Hello{self.username}, password {self.password}.")
+        print(f"Hello {self.username}, password {self.password}.")
         ret = self.access(str(self.username), self.password)
         return ret
 
@@ -41,7 +43,8 @@ def main():
     password = args.password
 
     l = Login(username, password)
-    print(l.login)
+    # print(l.login)
+    l.login()
 
 if __name__ == "__main__":
     main()
