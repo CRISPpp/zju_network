@@ -31,7 +31,7 @@
 ```
 同bond
 ```
-## xdp：网卡包监控程序
+## xdp：网卡包监控程序-参考https://github.com/xdp-project/xdp-tutorial
 ```
 直接执行打包好的可执行文件（在release中）
 ./xdp_packet_load -d 网卡名
