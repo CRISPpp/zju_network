@@ -18,7 +18,6 @@ class Login:
 
 
     def login(self):
-        print(f"Hello {self.username}, password {self.password}.")
         ret = self.access(str(self.username), self.password)
         return ret
 
