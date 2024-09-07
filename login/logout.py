@@ -1,42 +1,36 @@
 import argparse
-import urllib
-import urllib.request as urllib2
-import hashlib
+import requests
 
-class Logout:
-    def __init__(self, username, password):  
-        self.logout_url  = "http://192.0.0.6/cgi-bin/force_logout"
-        self.headers = {}
-        self.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.159 Safari/537.36"
-        self.headers["Content-Type"] = "text/html; charset=gb2312"
+url = 'http://192.0.0.6/cgi-bin/force_logout'
 
-        self.username = username
-        password_md5 = hashlib.md5(password.encode('utf-8')).hexdigest()[8:24]
-        self.password = password_md5
+parser = argparse.ArgumentParser(description='读取用户名和密码')
+parser.add_argument('-u', '--username', required=True, help='用户名')
+parser.add_argument('-p', '--password', required=True, help='密码')
 
+args = parser.parse_args()
 
-    def logout(self):
-        data = {'username': self.username, 'password': self.password, "drop": 0, "type": 1, "n": 1}
-        data = urllib.parse.urlencode(data).encode(encoding='UTF8')
-        req = urllib2.Request(self.logout_url, data=data, headers=self.headers)
-        res = urllib2.urlopen(req)
-        content = res.read().decode('UTF8')
-        return content
+username = args.username
+password = args.password
 
+headers = {
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Connection': 'keep-alive',
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Cookie': 'PHPSESSID=7943a8b9370461ffe5387baeaf5d3577',
+    'Origin': 'http://192.0.0.6',
+    'Referer': 'http://192.0.0.6/',
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+}
 
+data = {
+    'username': username,
+    'password': password,
+    'drop': '0',
+    'type': '1',
+    'n': '1'
+}
 
-def main():
-    parser = argparse.ArgumentParser(description='读取用户名和密码')
-    parser.add_argument('-u', '--username', required=True, help='用户名')
-    parser.add_argument('-p', '--password', required=True, help='密码')
+response = requests.post(url, headers=headers, data=data, verify=False)
 
-    args = parser.parse_args()
-
-    username = args.username
-    password = args.password
-
-    print(Logout(username, password))
-    
-
-if __name__ == "__main__":
-    main()
+print(response.text)
